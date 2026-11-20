@@ -7,6 +7,7 @@ const HEARTBEAT_INTERVAL_MS = 20000;
 const MAX_NAME_LENGTH = 16;
 const MATCH_DURATION_MS = 3 * 60 * 1000; // 3 dakika (180 saniye)
 const SLOT_COUNT = 8;
+const CARD_COLORS = ['RED', 'YELLOW', 'GREEN', 'BLUE'];
 
 const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url === '/health') {
@@ -27,17 +28,129 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Cardzy Oyun Sunucusu ${PORT} portunda çalışıyor...`);
 });
 
-function drawRandomCard() {
-  const value = Math.floor(Math.random() * 10); // 0..9
-  return { type: 'NUMBER', value };
+function shuffleArray(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
 }
 
-function createInitialSlots() {
+// 0-9 arası 4 renkten 2'şer adet = 80 kartlık gerçek fiziksel deste havuzu
+function createFullDeck() {
+  const deck = [];
+  for (let copy = 0; copy < 2; copy++) {
+    for (const color of CARD_COLORS) {
+      for (let value = 0; value <= 9; value++) {
+        deck.push({ type: 'NUMBER', value, color });
+      }
+    }
+  }
+  return shuffleArray(deck);
+}
+
+// Deste biterse ıskartadaki kartları karıştırıp yeni deste yapar
+function ensureDeckHasCards(room) {
+  if (room.deck.length > 0) return;
+
+  if (room.discardPile.length > 1) {
+    const topCard = room.discardPile.pop();
+    room.deck = shuffleArray([...room.discardPile]);
+    room.discardPile = [topCard];
+    console.log(`[♻️] Oda ${room.roomId}: Iskarta karıştırıldı, yeni deste: ${room.deck.length} kart`);
+  } else {
+    room.deck = createFullDeck();
+    console.log(`[♻️] Oda ${room.roomId}: Yeni 80 kartlık deste açıldı`);
+  }
+}
+
+// 3 Katmanlı Dinamik Pity + Tempo + Comeback Akıllı Kart Çekici
+function drawSmartCard(room, player, opponent) {
+  ensureDeckHasCards(room);
+
+  const elapsedSec = (Date.now() - room.startedAt) / 1000;
+  const closedSlotNumbers = new Set(
+    player.slots.filter((s) => !s.revealed).map((s) => s.slotIndex)
+  );
+  const myOpenCount = SLOT_COUNT - closedSlotNumbers.size;
+  const oppOpenCount = opponent.slots.filter((s) => s.revealed).length;
+  const dryStreak = player.dryStreak || 0;
+
+  // KATMAN 2: Pity Garantisi (Oyuncu 3 tur üst üste hiç yuva açamadıysa kapalı yuvasından garanti ver)
+  if (dryStreak >= 3 && closedSlotNumbers.size > 0) {
+    const guaranteedIdx = room.deck.findIndex((c) => closedSlotNumbers.has(c.value));
+    if (guaranteedIdx !== -1) {
+      const [picked] = room.deck.splice(guaranteedIdx, 1);
+      console.log(`[🎯 PITY-GARANTİ] ${player.name} (dryStreak=${dryStreak}) -> ${picked.color} ${picked.value}`);
+      return picked;
+    }
+  }
+
+  // Her kart için dinamik ağırlık hesapla
+  const weights = room.deck.map((card) => {
+    const isUseful = closedSlotNumbers.has(card.value);
+    const isZeroOrNine = card.value === 0 || card.value === 9;
+    let w = 1.0;
+
+    if (isUseful) {
+      // KATMAN 3: Tempo Eğrisi
+      if (elapsedSec < 60) {
+        w *= 1.45; // İlk 60 sn: Hızlı ve akıcı açılış
+      } else if (elapsedSec < 105) {
+        w *= 1.25; // Orta faz: Dengeli rekabet
+      } else {
+        w *= 1.85; // 105 sn sonrası: Final hızlandırma (1.5 - 2 dk bandında bitiş)
+      }
+
+      // KATMAN 2: 2 tur üst üste boş geçen oyuncuya şans desteği
+      if (dryStreak === 2) {
+        w *= 2.8;
+      } else if (dryStreak === 1) {
+        w *= 1.35;
+      }
+
+      // Geride kalan oyuncuya (2+ kart fark) yakalama (comeback) desteği
+      if (oppOpenCount - myOpenCount >= 2) {
+        w *= 1.55;
+      }
+    } else {
+      // İşe yaramayan kartlar (0, 9 veya zaten açık yuvalar)
+      if (dryStreak >= 2) {
+        w *= isZeroOrNine ? 0.25 : 0.40;
+      } else if (elapsedSec >= 105) {
+        w *= 0.50;
+      } else if (isZeroOrNine) {
+        w *= 0.85;
+      }
+    }
+
+    return Math.max(0.05, w);
+  });
+
+  const totalWeight = weights.reduce((acc, val) => acc + val, 0);
+  let r = Math.random() * totalWeight;
+  let chosenIndex = 0;
+
+  for (let i = 0; i < weights.length; i++) {
+    r -= weights[i];
+    if (r <= 0) {
+      chosenIndex = i;
+      break;
+    }
+  }
+
+  const [drawn] = room.deck.splice(chosenIndex, 1);
+  return drawn;
+}
+
+// Oyun başlangıcında desteden 8 kapalı kart üretir
+function createInitialSlots(deck) {
   const slots = [];
   for (let i = 1; i <= SLOT_COUNT; i++) {
+    const card = deck.pop() || { type: 'NUMBER', value: Math.floor(Math.random() * 10), color: 'RED' };
     slots.push({
       slotIndex: i,
-      card: drawRandomCard(),
+      card,
       revealed: false,
     });
   }
@@ -87,6 +200,7 @@ function broadcastRoomState(room, eventMeta = null) {
       roomId: room.roomId,
       isYourTurn: room.turnPlayerId === pid,
       remainingMs,
+      deckCount: room.deck.length,
       serverTime: Date.now(),
       topDiscard: room.discardPile.length > 0
         ? room.discardPile[room.discardPile.length - 1]
@@ -170,12 +284,10 @@ wss.on('connection', (ws) => {
     try {
       data = JSON.parse(rawMessage.toString());
     } catch (e) {
-      console.log(`[!] Geçersiz JSON (${ws.id})`);
       return;
     }
 
     if (!data || typeof data !== 'object') return;
-    console.log(`[MSG] ${ws.playerName || ws.id} -> ${JSON.stringify(data)}`);
 
     switch (data.type) {
       case 'FIND_MATCH':
@@ -197,7 +309,6 @@ wss.on('connection', (ws) => {
 
       case 'REQUEST_STATE': {
         const room = rooms.get(ws.roomId);
-        console.log(`[SYNC] ${ws.playerName || ws.id} oda: ${ws.roomId}, bulundu: ${Boolean(room)}`);
         if (room) broadcastRoomState(room, { kind: 'SYNC' });
         break;
       }
@@ -260,9 +371,14 @@ function createMatchRoom(p1, p2) {
   const firstPlayer = Math.random() < 0.5 ? p1 : p2;
   const now = Date.now();
   const endsAt = now + MATCH_DURATION_MS;
+  const deck = createFullDeck();
+
+  const p1Slots = createInitialSlots(deck);
+  const p2Slots = createInitialSlots(deck);
 
   const roomState = {
     roomId,
+    deck, // 80 karttan 16'sı dağıtıldı -> başlangıçta 64 kart kalır
     discardPile: [],
     turnPlayerId: firstPlayer.ws.id,
     startedAt: now,
@@ -274,13 +390,17 @@ function createMatchRoom(p1, p2) {
         ws: p1.ws,
         name: p1.playerName,
         heldCard: null,
-        slots: createInitialSlots(),
+        dryStreak: 0,
+        placedThisTurn: false,
+        slots: p1Slots,
       },
       [p2.ws.id]: {
         ws: p2.ws,
         name: p2.playerName,
         heldCard: null,
-        slots: createInitialSlots(),
+        dryStreak: 0,
+        placedThisTurn: false,
+        slots: p2Slots,
       },
     },
   };
@@ -293,7 +413,7 @@ function createMatchRoom(p1, p2) {
   p2.ws.roomId = roomId;
   rooms.set(roomId, roomState);
 
-  console.log(`[⚔️] Cardzy Eşleşme Bulundu! Oda: ${roomId} (${p1.playerName} vs ${p2.playerName}) İlk Sıra: ${firstPlayer.playerName}`);
+  console.log(`[⚔️] Cardzy Eşleşme Bulundu! Oda: ${roomId} (${p1.playerName} vs ${p2.playerName}) Kalan Deste: ${deck.length}`);
 
   sendMatchFound(p1.ws, p2.ws, roomState);
   sendMatchFound(p2.ws, p1.ws, roomState);
@@ -310,6 +430,7 @@ function sendMatchFound(targetWs, opponentWs, roomState) {
     opponentName: opponentWs.playerName,
     isYourTurn: roomState.turnPlayerId === targetWs.id,
     remainingMs: Math.max(0, roomState.endsAt - Date.now()),
+    deckCount: roomState.deck.length,
     slotCount: SLOT_COUNT,
     yourSlots: me.slots.map((s) => ({ slotIndex: s.slotIndex, revealed: false, card: null })),
     opponentSlots: opp.slots.map((s) => ({ slotIndex: s.slotIndex, revealed: false, card: null })),
@@ -336,13 +457,9 @@ function handleMatchTimeout(roomId) {
 
 function handleGameAction(ws, data) {
   const room = rooms.get(ws.roomId);
-  if (!room || room.isFinished) {
-    console.log(`[ACTION-ERR] Oda bulunamadı (${ws.playerName}): roomId=${ws.roomId}`);
-    return;
-  }
+  if (!room || room.isFinished) return;
 
   if (room.turnPlayerId !== ws.id) {
-    console.log(`[ACTION-ERR] Sıra hatası (${ws.playerName}): sıra=${room.turnPlayerId}, basan=${ws.id}`);
     safeSend(ws, {
       type: 'INVALID_MOVE',
       code: 'NOT_YOUR_TURN',
@@ -353,7 +470,8 @@ function handleGameAction(ws, data) {
 
   const player = room.players[ws.id];
   const opponentId = Object.keys(room.players).find((id) => id !== ws.id);
-  if (!player || !opponentId) return;
+  const opponent = room.players[opponentId];
+  if (!player || !opponent) return;
 
   switch (data.action) {
     case 'DRAW_CARD': {
@@ -366,9 +484,10 @@ function handleGameAction(ws, data) {
         return;
       }
 
-      const drawnCard = drawRandomCard();
+      const drawnCard = drawSmartCard(room, player, opponent);
       player.heldCard = drawnCard;
-      console.log(`[DRAW] ${player.name} kart çekti: ${drawnCard.value}`);
+      player.placedThisTurn = false;
+      console.log(`[DRAW] ${player.name} çekti: ${drawnCard.color} ${drawnCard.value} | Kalan Deste: ${room.deck.length}`);
 
       broadcastRoomState(room, {
         kind: 'CARD_DRAWN',
@@ -432,7 +551,8 @@ function handleGameAction(ws, data) {
       slot.card = held;
       slot.revealed = true;
       player.heldCard = revealedUnderneathCard;
-      console.log(`[PLACE] ${player.name} -> ${targetSlotIndex}. yuva açıldı, yeni kart: ${revealedUnderneathCard.value}`);
+      player.placedThisTurn = true;
+      player.dryStreak = 0; // Yuva açıldığı için boş tur sayacı sıfırlanır
 
       const allOpened = player.slots.every((s) => s.revealed);
       if (allOpened) {
@@ -479,10 +599,17 @@ function handleGameAction(ws, data) {
         return;
       }
 
+      // Bu turda hiç yuva açamadan ıskartaya attıysa dryStreak artır
+      if (!player.placedThisTurn) {
+        player.dryStreak = (player.dryStreak || 0) + 1;
+      } else {
+        player.dryStreak = 0;
+      }
+      player.placedThisTurn = false;
+
       room.discardPile.push(held);
       player.heldCard = null;
       room.turnPlayerId = opponentId;
-      console.log(`[DISCARD] ${player.name} kart attı: ${held.value} -> Sıra rakibe geçti`);
 
       broadcastRoomState(room, {
         kind: 'CARD_DISCARDED',

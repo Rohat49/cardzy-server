@@ -6,6 +6,8 @@ const PORT = process.env.PORT || 8080;
 const HEARTBEAT_INTERVAL_MS = 20000;
 const MAX_NAME_LENGTH = 16;
 const MATCH_DURATION_MS = 3 * 60 * 1000; // 3 dakika (180 saniye)
+const TURN_DURATION_MS = 15 * 1000; // Her hamle turu 15 saniye
+const INTRO_DELAY_MS = 7200; // 5 sn geri sayım + deste dönüşü + kart dağıtımı
 const SLOT_COUNT = 8;
 const CARD_COLORS = ['RED', 'YELLOW', 'GREEN', 'BLUE'];
 
@@ -46,7 +48,6 @@ function createFullDeck() {
       }
     }
   }
-  // Özel aksiyon kartları: 2 adet +1, 2 adet +2
   for (let i = 0; i < 2; i++) {
     deck.push({ type: 'PLUS_ONE', value: 1, color: 'SPECIAL' });
     deck.push({ type: 'PLUS_TWO', value: 2, color: 'SPECIAL' });
@@ -58,7 +59,6 @@ function isSpecialCard(card) {
   return card && (card.type === 'PLUS_ONE' || card.type === 'PLUS_TWO');
 }
 
-// Deste biterse ıskartadaki kartları karıştırıp yeni deste yapar
 function ensureDeckHasCards(room) {
   if (room.deck.length > 0) return;
 
@@ -73,7 +73,6 @@ function ensureDeckHasCards(room) {
   }
 }
 
-// Dinamik Pity + Tempo + Comeback + Özel Kart (+1/+2) Dengeleyici Akıllı Çekici
 function drawSmartCard(room, player, opponent) {
   ensureDeckHasCards(room);
 
@@ -84,9 +83,8 @@ function drawSmartCard(room, player, opponent) {
   const myOpenCount = SLOT_COUNT - closedSlotNumbers.size;
   const oppOpenCount = opponent.slots.filter((s) => s.revealed).length;
   const dryStreak = player.dryStreak || 0;
-  const leadDiff = oppOpenCount - myOpenCount; // Pozitifse oyuncu geride
+  const leadDiff = oppOpenCount - myOpenCount;
 
-  // KATMAN 2: Pity Garantisi (Oyuncu 3 tur üst üste hiç yuva açamadıysa kapalı yuvasından garanti ver)
   if (dryStreak >= 3 && closedSlotNumbers.size > 0) {
     const guaranteedIdx = room.deck.findIndex(
       (c) => c.type === 'NUMBER' && closedSlotNumbers.has(c.value)
@@ -98,25 +96,18 @@ function drawSmartCard(room, player, opponent) {
     }
   }
 
-  // Her kart için dinamik ağırlık hesapla
   const weights = room.deck.map((card) => {
     if (isSpecialCard(card)) {
-      // Oyuncunun elinde zaten bekleyen bir özel kart varsa ikinciyi çok nadir ver
       if (player.savedSpecialCard) return 0.15;
-
-      // Rakibin kapatılacak açık kartı yoksa özel kart ağırlığını düşür
       if (oppOpenCount === 0) return 0.25;
 
       let specialWeight = 0.95;
-      // Rakip 3 veya daha fazla kart açtıysa taktiksel dengeleme için şansı artır
       if (oppOpenCount >= 3) {
         specialWeight *= 1.45;
       }
-      // Oyuncu 2+ kart gerideyse ve rakibin açık kartları varsa comeback fırsatı sun
       if (leadDiff >= 2 && oppOpenCount >= 2) {
         specialWeight *= 1.75;
       }
-      // Oyuncu zaten 6-7 kart açıp bitirmeye çok yakınsa oyunu kilitlememek için biraz azalt
       if (myOpenCount >= 6 && leadDiff <= -2) {
         specialWeight *= 0.65;
       }
@@ -174,7 +165,6 @@ function drawSmartCard(room, player, opponent) {
   return drawn;
 }
 
-// Oyun başlangıcında desteden 8 kapalı kart üretir (yuva içindeki kartlar rakam kartı olur)
 function createInitialSlots(deck) {
   const slots = [];
   for (let i = 1; i <= SLOT_COUNT; i++) {
@@ -214,10 +204,69 @@ function canPlaceCard(playerState, card) {
   return Boolean(targetSlot && !targetSlot.revealed);
 }
 
+// 15 saniyelik hamle sayacını başlatır / sıfırlar
+function scheduleTurnTimer(room, extraDelayMs = 0) {
+  if (!room || room.isFinished) return;
+  if (room.turnTimer) {
+    clearTimeout(room.turnTimer);
+    room.turnTimer = null;
+  }
+
+  const duration = TURN_DURATION_MS + extraDelayMs;
+  room.turnDurationMs = TURN_DURATION_MS;
+  room.turnEndsAt = Date.now() + duration;
+
+  room.turnTimer = setTimeout(() => {
+    handleTurnTimeout(room.roomId);
+  }, duration);
+}
+
+// Oyuncu 15 saniye içinde hamle yapmazsa kartı boşa atılır ve sıra rakibe geçer
+function handleTurnTimeout(roomId) {
+  const room = rooms.get(roomId);
+  if (!room || room.isFinished) return;
+
+  const activeId = room.turnPlayerId;
+  const player = room.players[activeId];
+  const opponentId = Object.keys(room.players).find((id) => id !== activeId);
+  const opponent = room.players[opponentId];
+  if (!player || !opponent) return;
+
+  let discardedCard = null;
+  if (player.heldCard) {
+    discardedCard = player.heldCard;
+    if (discardedCard.type === 'NUMBER') {
+      room.discardPile.push(discardedCard);
+    } else {
+      room.deck.push(discardedCard);
+      shuffleArray(room.deck);
+    }
+    player.heldCard = null;
+  }
+
+  player.pendingFlipCount = 0;
+  player.placedThisTurn = false;
+  room.turnPlayerId = opponentId;
+
+  console.log(`[⏰ SÜRE DOLDU] ${player.name} 15 sn içinde oynamadı -> Sıra ${opponent.name}'e geçti.`);
+
+  scheduleTurnTimer(room, 0);
+  broadcastRoomState(room, {
+    kind: discardedCard && discardedCard.type === 'NUMBER'
+      ? 'CARD_DISCARDED'
+      : 'TURN_TIMEOUT',
+    actorId: activeId,
+    card: discardedCard,
+    nextTurnPlayerId: opponentId,
+  });
+}
+
 function broadcastRoomState(room, eventMeta = null) {
   if (!room || room.isFinished) return;
 
-  const remainingMs = Math.max(0, room.endsAt - Date.now());
+  const now = Date.now();
+  const remainingMs = Math.max(0, room.endsAt - now);
+  const turnRemainingMs = Math.max(0, (room.turnEndsAt || now) - now);
   const playerIds = Object.keys(room.players);
 
   playerIds.forEach((pid) => {
@@ -237,8 +286,10 @@ function broadcastRoomState(room, eventMeta = null) {
       roomId: room.roomId,
       isYourTurn: room.turnPlayerId === pid,
       remainingMs,
+      turnRemainingMs,
+      turnDurationMs: room.turnDurationMs || TURN_DURATION_MS,
       deckCount: room.deck.length,
-      serverTime: Date.now(),
+      serverTime: now,
       topDiscard: room.discardPile.length > 0
         ? room.discardPile[room.discardPile.length - 1]
         : null,
@@ -275,6 +326,10 @@ function finishMatch(room, winnerId, reason) {
   if (room.timer) {
     clearTimeout(room.timer);
     room.timer = null;
+  }
+  if (room.turnTimer) {
+    clearTimeout(room.turnTimer);
+    room.turnTimer = null;
   }
 
   const playerIds = Object.keys(room.players);
@@ -413,7 +468,7 @@ function createMatchRoom(p1, p2) {
   const roomId = randomUUID().slice(0, 8);
   const firstPlayer = Math.random() < 0.5 ? p1 : p2;
   const now = Date.now();
-  const endsAt = now + MATCH_DURATION_MS;
+  const endsAt = now + MATCH_DURATION_MS + INTRO_DELAY_MS;
   const deck = createFullDeck();
 
   const p1Slots = createInitialSlots(deck);
@@ -426,8 +481,11 @@ function createMatchRoom(p1, p2) {
     turnPlayerId: firstPlayer.ws.id,
     startedAt: now,
     endsAt,
+    turnEndsAt: now + INTRO_DELAY_MS + TURN_DURATION_MS,
+    turnDurationMs: TURN_DURATION_MS,
     isFinished: false,
     timer: null,
+    turnTimer: null,
     players: {
       [p1.ws.id]: {
         ws: p1.ws,
@@ -454,7 +512,9 @@ function createMatchRoom(p1, p2) {
 
   roomState.timer = setTimeout(() => {
     handleMatchTimeout(roomId);
-  }, MATCH_DURATION_MS);
+  }, MATCH_DURATION_MS + INTRO_DELAY_MS);
+
+  scheduleTurnTimer(roomState, INTRO_DELAY_MS);
 
   p1.ws.roomId = roomId;
   p2.ws.roomId = roomId;
@@ -469,6 +529,7 @@ function createMatchRoom(p1, p2) {
 function sendMatchFound(targetWs, opponentWs, roomState) {
   const me = roomState.players[targetWs.id];
   const opp = roomState.players[opponentWs.id];
+  const now = Date.now();
 
   safeSend(targetWs, {
     type: 'MATCH_FOUND',
@@ -476,7 +537,9 @@ function sendMatchFound(targetWs, opponentWs, roomState) {
     yourId: targetWs.id,
     opponentName: opponentWs.playerName,
     isYourTurn: roomState.turnPlayerId === targetWs.id,
-    remainingMs: Math.max(0, roomState.endsAt - Date.now()),
+    remainingMs: Math.max(0, roomState.endsAt - now),
+    turnRemainingMs: Math.max(0, roomState.turnEndsAt - now),
+    turnDurationMs: TURN_DURATION_MS,
     deckCount: roomState.deck.length,
     slotCount: SLOT_COUNT,
     yourSlots: me.slots.map((s) => ({ slotIndex: s.slotIndex, revealed: false, card: null })),
@@ -520,7 +583,6 @@ function handleGameAction(ws, data) {
   const opponent = room.players[opponentId];
   if (!player || !opponent) return;
 
-  // Eğer oyuncu şu an +1 / +2 ile rakip kartı seçme aşamasındaysa sadece FLIP_OPPONENT_SLOT kabul edilir
   if (player.pendingFlipCount > 0 && data.action !== 'FLIP_OPPONENT_SLOT') {
     safeSend(ws, {
       type: 'INVALID_MOVE',
@@ -554,7 +616,6 @@ function handleGameAction(ws, data) {
       break;
     }
 
-    // Çekilen +1 veya +2 kartını eldeki yedek yuvaya (profilin sağına) saklar
     case 'KEEP_SPECIAL_CARD': {
       const held = player.heldCard;
       if (!isSpecialCard(held)) {
@@ -566,7 +627,6 @@ function handleGameAction(ws, data) {
         return;
       }
 
-      // Önceden saklı bir özel kart varsa ıskartaya gönderip yenisini koy
       if (player.savedSpecialCard) {
         room.discardPile.push(player.savedSpecialCard);
       }
@@ -583,7 +643,6 @@ function handleGameAction(ws, data) {
       break;
     }
 
-    // Çekilen veya elde tutulan +1 / +2 kartını aktive eder
     case 'ACTIVATE_SPECIAL_CARD': {
       const source = data.source === 'SAVED' ? 'SAVED' : 'HELD';
       const card = source === 'SAVED' ? player.savedSpecialCard : player.heldCard;
@@ -638,7 +697,6 @@ function handleGameAction(ws, data) {
       break;
     }
 
-    // Rakibin açık kartlarından birini seçip ters çevirir
     case 'FLIP_OPPONENT_SLOT': {
       if ((player.pendingFlipCount || 0) <= 0) {
         safeSend(ws, {
@@ -669,7 +727,6 @@ function handleGameAction(ws, data) {
         return;
       }
 
-      // Kapatılan kartı tekrar deste içine geri karıştır
       if (targetSlot.card) {
         room.deck.push(targetSlot.card);
         shuffleArray(room.deck);
@@ -678,7 +735,6 @@ function handleGameAction(ws, data) {
       targetSlot.revealed = false;
       player.pendingFlipCount -= 1;
 
-      // Eğer rakibin tüm açık kartları bittiyse kalan hakkı sıfırla
       const remainingOppOpen = opponent.slots.filter((s) => s.revealed).length;
       if (remainingOppOpen === 0) {
         player.pendingFlipCount = 0;
@@ -776,6 +832,9 @@ function handleGameAction(ws, data) {
         return;
       }
 
+      // Kart yuvaya yerleşince hamle süresi yeni açık kart için 15 sn olarak yenilenir
+      scheduleTurnTimer(room, 0);
+
       broadcastRoomState(room, {
         kind: 'CARD_PLACED',
         actorId: ws.id,
@@ -827,6 +886,8 @@ function handleGameAction(ws, data) {
       player.heldCard = null;
       room.turnPlayerId = opponentId;
 
+      scheduleTurnTimer(room, 0);
+
       broadcastRoomState(room, {
         kind: 'CARD_DISCARDED',
         actorId: ws.id,
@@ -854,6 +915,7 @@ function handleDisconnectInRoom(ws) {
     finishMatch(room, opponentId, 'OPPONENT_LEFT');
   } else {
     if (room.timer) clearTimeout(room.timer);
+    if (room.turnTimer) clearTimeout(room.turnTimer);
     rooms.delete(room.roomId);
   }
 }

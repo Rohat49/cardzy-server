@@ -36,7 +36,7 @@ function shuffleArray(arr) {
   return arr;
 }
 
-// 0-9 arası 4 renkten 2'şer adet = 80 kartlık gerçek fiziksel deste havuzu
+// 0-9 arası 4 renkten 2'şer adet (80) + 2 adet +1 + 2 adet +2 = 84 kartlık deste
 function createFullDeck() {
   const deck = [];
   for (let copy = 0; copy < 2; copy++) {
@@ -46,7 +46,16 @@ function createFullDeck() {
       }
     }
   }
+  // Özel aksiyon kartları: 2 adet +1, 2 adet +2
+  for (let i = 0; i < 2; i++) {
+    deck.push({ type: 'PLUS_ONE', value: 1, color: 'SPECIAL' });
+    deck.push({ type: 'PLUS_TWO', value: 2, color: 'SPECIAL' });
+  }
   return shuffleArray(deck);
+}
+
+function isSpecialCard(card) {
+  return card && (card.type === 'PLUS_ONE' || card.type === 'PLUS_TWO');
 }
 
 // Deste biterse ıskartadaki kartları karıştırıp yeni deste yapar
@@ -60,11 +69,11 @@ function ensureDeckHasCards(room) {
     console.log(`[♻️] Oda ${room.roomId}: Iskarta karıştırıldı, yeni deste: ${room.deck.length} kart`);
   } else {
     room.deck = createFullDeck();
-    console.log(`[♻️] Oda ${room.roomId}: Yeni 80 kartlık deste açıldı`);
+    console.log(`[♻️] Oda ${room.roomId}: Yeni deste açıldı`);
   }
 }
 
-// 3 Katmanlı Dinamik Pity + Tempo + Comeback Akıllı Kart Çekici
+// Dinamik Pity + Tempo + Comeback + Özel Kart (+1/+2) Dengeleyici Akıllı Çekici
 function drawSmartCard(room, player, opponent) {
   ensureDeckHasCards(room);
 
@@ -75,10 +84,13 @@ function drawSmartCard(room, player, opponent) {
   const myOpenCount = SLOT_COUNT - closedSlotNumbers.size;
   const oppOpenCount = opponent.slots.filter((s) => s.revealed).length;
   const dryStreak = player.dryStreak || 0;
+  const leadDiff = oppOpenCount - myOpenCount; // Pozitifse oyuncu geride
 
   // KATMAN 2: Pity Garantisi (Oyuncu 3 tur üst üste hiç yuva açamadıysa kapalı yuvasından garanti ver)
   if (dryStreak >= 3 && closedSlotNumbers.size > 0) {
-    const guaranteedIdx = room.deck.findIndex((c) => closedSlotNumbers.has(c.value));
+    const guaranteedIdx = room.deck.findIndex(
+      (c) => c.type === 'NUMBER' && closedSlotNumbers.has(c.value)
+    );
     if (guaranteedIdx !== -1) {
       const [picked] = room.deck.splice(guaranteedIdx, 1);
       console.log(`[🎯 PITY-GARANTİ] ${player.name} (dryStreak=${dryStreak}) -> ${picked.color} ${picked.value}`);
@@ -88,33 +100,52 @@ function drawSmartCard(room, player, opponent) {
 
   // Her kart için dinamik ağırlık hesapla
   const weights = room.deck.map((card) => {
+    if (isSpecialCard(card)) {
+      // Oyuncunun elinde zaten bekleyen bir özel kart varsa ikinciyi çok nadir ver
+      if (player.savedSpecialCard) return 0.15;
+
+      // Rakibin kapatılacak açık kartı yoksa özel kart ağırlığını düşür
+      if (oppOpenCount === 0) return 0.25;
+
+      let specialWeight = 0.95;
+      // Rakip 3 veya daha fazla kart açtıysa taktiksel dengeleme için şansı artır
+      if (oppOpenCount >= 3) {
+        specialWeight *= 1.45;
+      }
+      // Oyuncu 2+ kart gerideyse ve rakibin açık kartları varsa comeback fırsatı sun
+      if (leadDiff >= 2 && oppOpenCount >= 2) {
+        specialWeight *= 1.75;
+      }
+      // Oyuncu zaten 6-7 kart açıp bitirmeye çok yakınsa oyunu kilitlememek için biraz azalt
+      if (myOpenCount >= 6 && leadDiff <= -2) {
+        specialWeight *= 0.65;
+      }
+      return specialWeight;
+    }
+
     const isUseful = closedSlotNumbers.has(card.value);
     const isZeroOrNine = card.value === 0 || card.value === 9;
     let w = 1.0;
 
     if (isUseful) {
-      // KATMAN 3: Tempo Eğrisi
       if (elapsedSec < 60) {
-        w *= 1.45; // İlk 60 sn: Hızlı ve akıcı açılış
+        w *= 1.45;
       } else if (elapsedSec < 105) {
-        w *= 1.25; // Orta faz: Dengeli rekabet
+        w *= 1.25;
       } else {
-        w *= 1.85; // 105 sn sonrası: Final hızlandırma (1.5 - 2 dk bandında bitiş)
+        w *= 1.85;
       }
 
-      // KATMAN 2: 2 tur üst üste boş geçen oyuncuya şans desteği
       if (dryStreak === 2) {
         w *= 2.8;
       } else if (dryStreak === 1) {
         w *= 1.35;
       }
 
-      // Geride kalan oyuncuya (2+ kart fark) yakalama (comeback) desteği
-      if (oppOpenCount - myOpenCount >= 2) {
+      if (leadDiff >= 2) {
         w *= 1.55;
       }
     } else {
-      // İşe yaramayan kartlar (0, 9 veya zaten açık yuvalar)
       if (dryStreak >= 2) {
         w *= isZeroOrNine ? 0.25 : 0.40;
       } else if (elapsedSec >= 105) {
@@ -143,11 +174,17 @@ function drawSmartCard(room, player, opponent) {
   return drawn;
 }
 
-// Oyun başlangıcında desteden 8 kapalı kart üretir
+// Oyun başlangıcında desteden 8 kapalı kart üretir (yuva içindeki kartlar rakam kartı olur)
 function createInitialSlots(deck) {
   const slots = [];
   for (let i = 1; i <= SLOT_COUNT; i++) {
-    const card = deck.pop() || { type: 'NUMBER', value: Math.floor(Math.random() * 10), color: 'RED' };
+    let idx = deck.findIndex((c) => c.type === 'NUMBER');
+    let card;
+    if (idx !== -1) {
+      [card] = deck.splice(idx, 1);
+    } else {
+      card = { type: 'NUMBER', value: Math.floor(Math.random() * 10), color: 'RED' };
+    }
     slots.push({
       slotIndex: i,
       card,
@@ -209,7 +246,11 @@ function broadcastRoomState(room, eventMeta = null) {
         id: pid,
         name: me.name,
         heldCard: me.heldCard,
-        mustDiscard: me.heldCard ? !canPlaceCard(me, me.heldCard) : false,
+        savedSpecialCard: me.savedSpecialCard,
+        pendingFlipCount: me.pendingFlipCount || 0,
+        mustDiscard: me.heldCard && me.heldCard.type === 'NUMBER'
+          ? !canPlaceCard(me, me.heldCard)
+          : false,
         openCount: me.slots.filter((s) => s.revealed).length,
         slots: sanitizeSlots(me.slots),
       },
@@ -217,6 +258,8 @@ function broadcastRoomState(room, eventMeta = null) {
         id: oppId,
         name: opp.name,
         heldCard: opp.heldCard,
+        savedSpecialCard: opp.savedSpecialCard,
+        pendingFlipCount: opp.pendingFlipCount || 0,
         openCount: opp.slots.filter((s) => s.revealed).length,
         slots: sanitizeSlots(opp.slots),
       },
@@ -378,7 +421,7 @@ function createMatchRoom(p1, p2) {
 
   const roomState = {
     roomId,
-    deck, // 80 karttan 16'sı dağıtıldı -> başlangıçta 64 kart kalır
+    deck,
     discardPile: [],
     turnPlayerId: firstPlayer.ws.id,
     startedAt: now,
@@ -390,6 +433,8 @@ function createMatchRoom(p1, p2) {
         ws: p1.ws,
         name: p1.playerName,
         heldCard: null,
+        savedSpecialCard: null,
+        pendingFlipCount: 0,
         dryStreak: 0,
         placedThisTurn: false,
         slots: p1Slots,
@@ -398,6 +443,8 @@ function createMatchRoom(p1, p2) {
         ws: p2.ws,
         name: p2.playerName,
         heldCard: null,
+        savedSpecialCard: null,
+        pendingFlipCount: 0,
         dryStreak: 0,
         placedThisTurn: false,
         slots: p2Slots,
@@ -473,13 +520,23 @@ function handleGameAction(ws, data) {
   const opponent = room.players[opponentId];
   if (!player || !opponent) return;
 
+  // Eğer oyuncu şu an +1 / +2 ile rakip kartı seçme aşamasındaysa sadece FLIP_OPPONENT_SLOT kabul edilir
+  if (player.pendingFlipCount > 0 && data.action !== 'FLIP_OPPONENT_SLOT') {
+    safeSend(ws, {
+      type: 'INVALID_MOVE',
+      code: 'MUST_SELECT_OPPONENT_CARD',
+      message: `Önce rakibin ${player.pendingFlipCount} açık kartını seçmelisin!`,
+    });
+    return;
+  }
+
   switch (data.action) {
     case 'DRAW_CARD': {
       if (player.heldCard !== null) {
         safeSend(ws, {
           type: 'INVALID_MOVE',
           code: 'ALREADY_HOLDING_CARD',
-          message: 'Elindeki kartı önce yerleştirmeli veya kenara atmalısın.',
+          message: 'Önce elindeki kartı tamamlamalısın.',
         });
         return;
       }
@@ -487,12 +544,154 @@ function handleGameAction(ws, data) {
       const drawnCard = drawSmartCard(room, player, opponent);
       player.heldCard = drawnCard;
       player.placedThisTurn = false;
-      console.log(`[DRAW] ${player.name} çekti: ${drawnCard.color} ${drawnCard.value} | Kalan Deste: ${room.deck.length}`);
+      console.log(`[DRAW] ${player.name} çekti: ${drawnCard.type} ${drawnCard.color} ${drawnCard.value} | Kalan: ${room.deck.length}`);
 
       broadcastRoomState(room, {
         kind: 'CARD_DRAWN',
         actorId: ws.id,
         card: drawnCard,
+      });
+      break;
+    }
+
+    // Çekilen +1 veya +2 kartını eldeki yedek yuvaya (profilin sağına) saklar
+    case 'KEEP_SPECIAL_CARD': {
+      const held = player.heldCard;
+      if (!isSpecialCard(held)) {
+        safeSend(ws, {
+          type: 'INVALID_MOVE',
+          code: 'NOT_SPECIAL_CARD',
+          message: 'Sadece +1 ve +2 kartları elde tutulabilir.',
+        });
+        return;
+      }
+
+      // Önceden saklı bir özel kart varsa ıskartaya gönderip yenisini koy
+      if (player.savedSpecialCard) {
+        room.discardPile.push(player.savedSpecialCard);
+      }
+
+      player.savedSpecialCard = held;
+      player.heldCard = null;
+      console.log(`[KEEP] ${player.name} ${held.type} kartını elde tuttu.`);
+
+      broadcastRoomState(room, {
+        kind: 'SPECIAL_KEPT',
+        actorId: ws.id,
+        card: held,
+      });
+      break;
+    }
+
+    // Çekilen veya elde tutulan +1 / +2 kartını aktive eder
+    case 'ACTIVATE_SPECIAL_CARD': {
+      const source = data.source === 'SAVED' ? 'SAVED' : 'HELD';
+      const card = source === 'SAVED' ? player.savedSpecialCard : player.heldCard;
+
+      if (!isSpecialCard(card)) {
+        safeSend(ws, {
+          type: 'INVALID_MOVE',
+          code: 'NO_SPECIAL_CARD',
+          message: 'Kullanılacak +1 veya +2 kartın yok.',
+        });
+        return;
+      }
+
+      if (source === 'SAVED' && player.heldCard !== null) {
+        safeSend(ws, {
+          type: 'INVALID_MOVE',
+          code: 'RESOLVE_HELD_FIRST',
+          message: 'Önce ortadaki açık kartını oyna.',
+        });
+        return;
+      }
+
+      const oppOpenCount = opponent.slots.filter((s) => s.revealed).length;
+      if (oppOpenCount === 0) {
+        safeSend(ws, {
+          type: 'INVALID_MOVE',
+          code: 'NO_OPPONENT_OPEN_CARDS',
+          message: 'Rakibin kapatılacak açık kartı yok!',
+        });
+        return;
+      }
+
+      const neededFlips = card.type === 'PLUS_TWO' ? 2 : 1;
+      const actualFlips = Math.min(neededFlips, oppOpenCount);
+
+      if (source === 'SAVED') {
+        player.savedSpecialCard = null;
+      } else {
+        player.heldCard = null;
+      }
+
+      room.discardPile.push(card);
+      player.pendingFlipCount = actualFlips;
+      console.log(`[SPECIAL] ${player.name} ${card.type} oynadı! Kapatılacak kart: ${actualFlips}`);
+
+      broadcastRoomState(room, {
+        kind: 'SPECIAL_ACTIVATED',
+        actorId: ws.id,
+        card,
+        remainingFlips: actualFlips,
+      });
+      break;
+    }
+
+    // Rakibin açık kartlarından birini seçip ters çevirir
+    case 'FLIP_OPPONENT_SLOT': {
+      if ((player.pendingFlipCount || 0) <= 0) {
+        safeSend(ws, {
+          type: 'INVALID_MOVE',
+          code: 'NO_PENDING_FLIP',
+          message: 'Şu an rakip kartı seçme hakkın yok.',
+        });
+        return;
+      }
+
+      const targetSlotIndex = Number(data.slotIndex);
+      if (!Number.isInteger(targetSlotIndex) || targetSlotIndex < 1 || targetSlotIndex > SLOT_COUNT) {
+        safeSend(ws, {
+          type: 'INVALID_MOVE',
+          code: 'INVALID_SLOT',
+          message: 'Geçersiz kart yuvası.',
+        });
+        return;
+      }
+
+      const targetSlot = opponent.slots[targetSlotIndex - 1];
+      if (!targetSlot || !targetSlot.revealed) {
+        safeSend(ws, {
+          type: 'INVALID_MOVE',
+          code: 'SLOT_ALREADY_CLOSED',
+          message: 'Bu kart zaten kapalı, açık bir kart seç!',
+        });
+        return;
+      }
+
+      // Kapatılan kartı tekrar deste içine geri karıştır
+      if (targetSlot.card) {
+        room.deck.push(targetSlot.card);
+        shuffleArray(room.deck);
+      }
+
+      targetSlot.revealed = false;
+      player.pendingFlipCount -= 1;
+
+      // Eğer rakibin tüm açık kartları bittiyse kalan hakkı sıfırla
+      const remainingOppOpen = opponent.slots.filter((s) => s.revealed).length;
+      if (remainingOppOpen === 0) {
+        player.pendingFlipCount = 0;
+      }
+
+      console.log(`[FLIP] ${player.name}, ${opponent.name}'in ${targetSlotIndex}. kartını kapattı. Kalan seçim: ${player.pendingFlipCount}`);
+
+      broadcastRoomState(room, {
+        kind: 'OPPONENT_CARD_FLIPPED',
+        actorId: ws.id,
+        targetPlayerId: opponentId,
+        slotIndex: targetSlotIndex,
+        remainingFlips: player.pendingFlipCount,
       });
       break;
     }
@@ -504,6 +703,15 @@ function handleGameAction(ws, data) {
           type: 'INVALID_MOVE',
           code: 'NO_HELD_CARD',
           message: 'Önce desteden kart çekmelisin.',
+        });
+        return;
+      }
+
+      if (held.type !== 'NUMBER') {
+        safeSend(ws, {
+          type: 'INVALID_MOVE',
+          code: 'SPECIAL_CANNOT_BE_PLACED',
+          message: '+1 ve +2 kartları yuvaya konmaz; kullan veya elde tut.',
         });
         return;
       }
@@ -552,7 +760,7 @@ function handleGameAction(ws, data) {
       slot.revealed = true;
       player.heldCard = revealedUnderneathCard;
       player.placedThisTurn = true;
-      player.dryStreak = 0; // Yuva açıldığı için boş tur sayacı sıfırlanır
+      player.dryStreak = 0;
 
       const allOpened = player.slots.every((s) => s.revealed);
       if (allOpened) {
@@ -589,6 +797,15 @@ function handleGameAction(ws, data) {
         return;
       }
 
+      if (isSpecialCard(held)) {
+        safeSend(ws, {
+          type: 'INVALID_MOVE',
+          code: 'SPECIAL_CANNOT_DISCARD',
+          message: '+1 veya +2 kartını kullanabilir ya da elde tutabilirsin.',
+        });
+        return;
+      }
+
       if (canPlaceCard(player, held)) {
         safeSend(ws, {
           type: 'INVALID_MOVE',
@@ -599,7 +816,6 @@ function handleGameAction(ws, data) {
         return;
       }
 
-      // Bu turda hiç yuva açamadan ıskartaya attıysa dryStreak artır
       if (!player.placedThisTurn) {
         player.dryStreak = (player.dryStreak || 0) + 1;
       } else {
